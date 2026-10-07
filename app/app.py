@@ -445,8 +445,9 @@ elif page == "docs":
 
     with tab1:
         section("Carica documenti")
-        st.caption("Supportati: PDF, DOCX, MSG, PST, PPTX, XLSX, XLS, CSV, TXT, MD — oppure un archivio ZIP. Nessun limite sul numero di file.")
-        DOC_TYPES = ["pdf","docx","msg","pst","pptx","xlsx","xls","csv","txt","md","zip"]
+        st.caption("Supportati: PDF, DOCX, MSG, PST, PPTX, XLSX, XLS, CSV, TXT, MD, immagini (PNG, JPG, GIF, WEBP, BMP, TIFF) — oppure un archivio ZIP. Le immagini dentro i file vengono lette e descritte. Nessun limite sul numero di file.")
+        DOC_TYPES = ["pdf","docx","msg","pst","pptx","xlsx","xls","csv","txt","md","zip",
+                     "png","jpg","jpeg","gif","webp","bmp","tif","tiff"]
         modalita_upload = st.radio("Cosa vuoi caricare?", ["File", "Cartella intera"], horizontal=True,
                                    label_visibility="collapsed")
         if modalita_upload == "File":
