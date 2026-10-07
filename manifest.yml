@@ -1,0 +1,27 @@
+applications:
+  - name: ipmp-backend
+    memory: 512M
+    buildpacks:
+      - python_buildpack
+    command: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    services:
+      - ipmp-hana
+    env:
+      PROJECT_ID: demo
+      AICORE_RESOURCE_GROUP: i-pmp
+      AICORE_BASE_URL: https://api.ai.prod.eu-central-1.aws.ml.hana.ondemand.com
+      CHAT_MODEL: anthropic--claude-4.6-sonnet
+      EMBED_MODEL: text-embedding-3-large
+      EMBED_DIMS: "3072"
+      # Segreti: impostare con `cf set-env` dopo il push
+      # AICORE_AUTH_URL, AICORE_CLIENT_ID, AICORE_CLIENT_SECRET
+      # CHAT_DEPLOYMENT_ID, EMBED_DEPLOYMENT_ID
+      # HANA_HOST, HANA_PORT, HANA_USER, HANA_PASSWORD
+
+  - name: ipmp-app
+    memory: 512M
+    buildpacks:
+      - python_buildpack
+    command: streamlit run app/app.py --server.port $PORT --server.headless true --server.address 0.0.0.0
+    env:
+      BACKEND_URL: https://ipmp-backend.cfapps.eu10.hana.ondemand.com

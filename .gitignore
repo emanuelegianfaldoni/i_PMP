@@ -1,0 +1,27 @@
+# Credenziali — mai committare
+.env
+.env.local
+
+# Database locale: contiene i chunk dei documenti ingeriti
+*.db
+*.sqlite
+*.sqlite3
+
+# Artefatti generati
+*.docx
+*.pptx
+playbook_*.docx
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Tool e sistema
+.claude/
+.DS_Store
