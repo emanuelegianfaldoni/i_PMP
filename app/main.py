@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import shutil
+import zipfile
 from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
@@ -12,7 +13,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).parent.parent))
 load_dotenv()
 
-from agents.extraction_agent import pipeline_ingestion
+from agents.extraction_agent import pipeline_ingestion, estrai_archivio, SUPPORTED_EXT
 from agents.orchestrator import Orchestrator
 from agents.scope_guardian import ScopeGuardian, carica_contratto
 from agents.playbook import PlaybookAgent
@@ -59,10 +60,39 @@ async def ingest(file: UploadFile = File(...), project_id: str = Query(None)):
             tmp.write(chunk)
         tmp_path = tmp.name
     try:
+        if suffix.lower() == ".zip":
+            return _ingest_archivio(tmp_path, file.filename, pid)
+        if suffix.lower() not in SUPPORTED_EXT:
+            raise HTTPException(status_code=415, detail=f"Formato non supportato: {suffix}")
         result = pipeline_ingestion(tmp_path, pid, source_name=file.filename)
     finally:
         os.unlink(tmp_path)
     return result
+
+
+def _ingest_archivio(zip_path: str, zip_name: str, pid: str) -> dict:
+    out_dir = tempfile.mkdtemp(prefix="ipmp_zip_")
+    try:
+        try:
+            estratti = estrai_archivio(zip_path, out_dir)
+        except (ValueError, zipfile.BadZipFile) as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        files = []
+        for path, rel in estratti:
+            try:
+                r = pipeline_ingestion(path, pid, source_name=f"{zip_name}/{rel}")
+                r["_ok"] = True
+            except Exception as e:
+                r = {"source": f"{zip_name}/{rel}", "_ok": False, "error": str(e)}
+            files.append(r)
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+    return {
+        "source": zip_name,
+        "archive": True,
+        "files": files,
+        "chunks": sum(f.get("chunks", 0) for f in files),
+    }
 
 
 @app.post("/load-contract")

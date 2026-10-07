@@ -1,9 +1,100 @@
 import os
 import sys
 import json
+import shutil
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from services.hana import is_sqlite
+
+SUPPORTED_EXT = {".pdf", ".docx", ".msg", ".pst", ".pptx", ".xlsx", ".xls", ".csv", ".txt", ".md"}
+TABULAR_EXT = {".xlsx", ".xls", ".csv"}
+MAX_ARCHIVE_BYTES = 5 * 1024 ** 3  # difesa da zip bomb: 5 GB decompressi
+
+
+def _cella(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v).strip()
+
+
+def _tabella_in_righe(rows, titolo: str) -> list[str]:
+    """Ogni riga diventa 'Colonna: valore | ...' così resta comprensibile anche presa da sola."""
+    out = [f"[{titolo}]"]
+    header = None
+    for row in rows:
+        cells = [_cella(c) for c in row]
+        if not any(cells):
+            continue
+        if header is None:
+            header = [c or f"Colonna {i + 1}" for i, c in enumerate(cells)]
+            continue
+        pairs = []
+        for i, val in enumerate(cells):
+            if val:
+                name = header[i] if i < len(header) else f"Colonna {i + 1}"
+                pairs.append(f"{name}: {val}")
+        out.append(" | ".join(pairs))
+    if header is not None and len(out) == 1:
+        out.append(" | ".join(header))
+    return out
+
+
+def spezza_righe(text: str, max_words: int = 120) -> list[str]:
+    """Chunking per tabelle: non spezza mai una riga e ripete il titolo del foglio in ogni chunk."""
+    chunks, current, n_words, titolo = [], [], 0, ""
+
+    def flush():
+        nonlocal current, n_words
+        if current:
+            chunks.append("\n".join(([titolo] if titolo else []) + current))
+        current, n_words = [], 0
+
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            flush()
+            titolo = line
+            continue
+        w = len(line.split())
+        if w > max_words:
+            flush()
+            for piece in spezza(line, dim=max_words, overlap=max_words // 8):
+                chunks.append(f"{titolo}\n{piece}" if titolo else piece)
+            continue
+        if n_words + w > max_words:
+            flush()
+        current.append(line)
+        n_words += w
+    flush()
+    return chunks
+
+
+def estrai_archivio(zip_path: str, dest_dir: str) -> list[tuple[str, str]]:
+    """Estrae dallo ZIP solo i file supportati. Ritorna (percorso_su_disco, percorso_relativo)."""
+    import zipfile
+    dest = Path(dest_dir).resolve()
+    estratti = []
+    with zipfile.ZipFile(zip_path) as zf:
+        membri = [
+            m for m in zf.infolist()
+            if not m.is_dir()
+            and Path(m.filename).suffix.lower() in SUPPORTED_EXT
+            and not any(p.startswith(".") or p == "__MACOSX" for p in Path(m.filename).parts)
+        ]
+        if sum(m.file_size for m in membri) > MAX_ARCHIVE_BYTES:
+            raise ValueError("Archivio troppo grande una volta decompresso (limite 5 GB)")
+        for m in membri:
+            target = (dest / m.filename).resolve()
+            if dest not in target.parents:
+                continue  # percorso che esce dalla cartella di destinazione (zip slip)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(m) as src, open(target, "wb") as out:
+                shutil.copyfileobj(src, out)
+            estratti.append((str(target), m.filename))
+    return estratti
 
 
 def leggi_file(file_path: str) -> str:
@@ -112,18 +203,37 @@ def leggi_file(file_path: str) -> str:
         pst_file.close()
         return "\n\n".join(parts)
 
-    if ext in (".xlsx", ".xls"):
+    if ext == ".xlsx":
         import openpyxl
         wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
         parts = []
         for sheet in wb.worksheets:
-            parts.append(f"[Foglio: {sheet.title}]")
-            for row in sheet.iter_rows(values_only=True):
-                cells = [str(c) for c in row if c is not None]
-                if cells:
-                    parts.append("\t".join(cells))
+            parts.extend(_tabella_in_righe(sheet.iter_rows(values_only=True), f"Foglio: {sheet.title}"))
         wb.close()
         return "\n".join(parts)
+
+    if ext == ".xls":
+        import xlrd
+        wb = xlrd.open_workbook(file_path)
+        parts = []
+        for sheet in wb.sheets():
+            rows = (sheet.row_values(i) for i in range(sheet.nrows))
+            parts.extend(_tabella_in_righe(rows, f"Foglio: {sheet.name}"))
+        return "\n".join(parts)
+
+    if ext == ".csv":
+        import csv
+        raw = Path(file_path).read_bytes()
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = raw.decode("latin-1")
+        try:
+            dialect = csv.Sniffer().sniff(text[:20000], delimiters=",;\t|")
+        except csv.Error:
+            dialect = csv.excel
+        rows = csv.reader(text.splitlines(), dialect)
+        return "\n".join(_tabella_in_righe(rows, f"File: {Path(file_path).name}"))
 
     if ext == ".pptx":
         from pptx import Presentation
@@ -162,7 +272,10 @@ def pipeline_ingestion(file_path: str, project_id: str = None, source_name: str 
 
     source_name = source_name or Path(file_path).name
     full_text = leggi_file(file_path)
-    chunks = spezza(full_text)
+    if Path(file_path).suffix.lower() in TABULAR_EXT:
+        chunks = spezza_righe(full_text)
+    else:
+        chunks = spezza(full_text)
 
     results: dict = {"source": source_name, "chunks": len(chunks)}
 

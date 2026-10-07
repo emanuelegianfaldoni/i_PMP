@@ -445,9 +445,19 @@ elif page == "docs":
 
     with tab1:
         section("Carica documenti")
-        st.caption("Supportati: PDF, DOCX, MSG, PST, PPTX, XLSX, XLS, TXT")
-        uploaded_files = st.file_uploader("", type=["pdf","docx","msg","pst","pptx","xlsx","xls","txt"],
-                                          key="doc_upload", accept_multiple_files=True, label_visibility="collapsed")
+        st.caption("Supportati: PDF, DOCX, MSG, PST, PPTX, XLSX, XLS, CSV, TXT, MD — oppure un archivio ZIP. Nessun limite sul numero di file.")
+        DOC_TYPES = ["pdf","docx","msg","pst","pptx","xlsx","xls","csv","txt","md","zip"]
+        modalita_upload = st.radio("Cosa vuoi caricare?", ["File", "Cartella intera"], horizontal=True,
+                                   label_visibility="collapsed")
+        if modalita_upload == "File":
+            uploaded_files = st.file_uploader("Documenti", type=DOC_TYPES, key="doc_upload",
+                                              accept_multiple_files=True, label_visibility="collapsed")
+        else:
+            st.caption("Vengono caricati tutti i file supportati della cartella e delle sue sottocartelle.")
+            uploaded_files = st.file_uploader("Cartella", type=DOC_TYPES, key="dir_upload",
+                                              accept_multiple_files="directory", label_visibility="collapsed")
+        if uploaded_files:
+            st.caption(f"{len(uploaded_files)} file selezionati")
         if uploaded_files and st.button("📤  Processa documenti", type="primary"):
             totale = len(uploaded_files)
             bar = st.progress(0, text=f"Elaborazione 0/{totale}...")
@@ -456,14 +466,21 @@ elif page == "docs":
                 with st.spinner(f"[{idx+1}/{totale}] {f.name}"):
                     r = api("post", "/ingest", files={"file": (f.name, f.getvalue(), f.type)})
                 res = r.json() if r else {}
-                res["_nome"] = f.name
-                res["_ok"] = bool(r)
-                risultati.append(res)
+                if res.get("archive"):
+                    if not res.get("files"):
+                        risultati.append({"_nome": f"{f.name} (nessun file supportato)", "_ok": False})
+                    for sub in res.get("files", []):
+                        risultati.append({**sub, "_nome": sub.get("source", "?"), "_ok": sub.get("_ok", False)})
+                else:
+                    res["_nome"] = f.name
+                    res["_ok"] = bool(r)
+                    risultati.append(res)
                 bar.progress((idx+1)/totale, text=f"Elaborazione {idx+1}/{totale}...")
             bar.empty()
 
             ok = sum(1 for x in risultati if x["_ok"])
-            st.success(f"✅ {ok}/{totale} file processati") if ok == totale else st.warning(f"⚠️ {ok}/{totale} file processati")
+            n = len(risultati)
+            st.success(f"✅ {ok}/{n} file processati") if ok == n else st.warning(f"⚠️ {ok}/{n} file processati")
 
             for res in risultati:
                 icon = "✅" if res["_ok"] else "❌"
@@ -477,6 +494,8 @@ elif page == "docs":
                         c3.metric("Decisioni", dec.get("found",0))
                         sc = res.get("scope",{})
                         c4.metric("Scope", "⚠️ Out" if sc.get("fuori_scope") else "✅ OK")
+                    elif res.get("error"):
+                        st.error(res["error"])
 
     with tab2:
         col_c, col_cr = st.columns(2, gap="large")

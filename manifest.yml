@@ -4,10 +4,9 @@ applications:
     buildpacks:
       - python_buildpack
     command: uvicorn app.main:app --host 0.0.0.0 --port $PORT
-    services:
-      - ipmp-hana
     env:
       PROJECT_ID: demo
+      USE_SQLITE: "false"
       AICORE_RESOURCE_GROUP: i-pmp
       AICORE_BASE_URL: https://api.ai.prod.eu-central-1.aws.ml.hana.ondemand.com
       CHAT_MODEL: anthropic--claude-4.6-sonnet
@@ -24,4 +23,4 @@ applications:
       - python_buildpack
     command: streamlit run app/app.py --server.port $PORT --server.headless true --server.address 0.0.0.0
     env:
-      BACKEND_URL: https://ipmp-backend.cfapps.eu10.hana.ondemand.com
+      BACKEND_URL: https://ipmp-backend.cfapps.eu10-004.hana.ondemand.com
