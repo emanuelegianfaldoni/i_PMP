@@ -339,7 +339,8 @@ def invia_file(path: str, f):
 
 
 JOB_ATTIVI = ("in_coda", "in_corso")
-ESTENSIONI_DOCUMENTI = [".pdf", ".docx", ".msg", ".pst", ".pptx", ".xlsx", ".xls", ".csv", ".txt"]
+ESTENSIONI_DOCUMENTI = [".pdf", ".docx", ".msg", ".pst", ".pptx", ".xlsx", ".xls", ".csv", ".txt", ".md", ".zip",
+                        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"]
 _HTML_CARICAMENTO = (Path(__file__).parent / "upload_component.html").read_text(encoding="utf-8")
 
 
@@ -347,7 +348,7 @@ def componente_caricamento(lotto: str, disabilitato: bool, motivo: str):
     """Caricamento documenti dal browser direttamente al backend: i file non passano dalla memoria di Streamlit."""
     config = {"backend": BACKEND.rstrip("/"), "lotto": lotto, "disabilitato": disabilitato, "motivo": motivo,
               "estensioni": ESTENSIONI_DOCUMENTI, "max_mb": 500}
-    components.html(_HTML_CARICAMENTO.replace("__CONFIG__", json.dumps(config)), height=290)
+    components.html(_HTML_CARICAMENTO.replace("__CONFIG__", json.dumps(config)), height=310)
 
 
 def leggi_jobs() -> list[dict]:
@@ -531,6 +532,8 @@ elif page == "docs":
         section("Carica documenti")
         motivo = ("Elaborazione in corso: potrai aggiungere altri documenti al termine." if in_elaborazione
                   else "Spazio di archiviazione quasi esaurito." if spazio_esaurito else "")
+        st.caption("Puoi caricare anche una cartella intera (con le sottocartelle) o un archivio ZIP. "
+                   "Le immagini dentro i file vengono lette e descritte.")
         componente_caricamento(ss.lotto, bloccato, motivo)
 
         @st.fragment(run_every=3)
@@ -585,6 +588,8 @@ elif page == "docs":
                         st.error(j["errore"])
                     elif res.get("duplicate_of"):
                         st.write(f"Contenuto identico a **{res['duplicate_of']}**, già caricato. Nessuna modifica.")
+                    elif res.get("warning"):
+                        st.warning(res["warning"])
                     else:
                         if res.get("replaced"):
                             st.caption("🔄 Nuova versione: ha sostituito il documento caricato in precedenza con lo stesso nome")

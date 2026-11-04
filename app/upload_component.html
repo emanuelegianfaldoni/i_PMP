@@ -19,6 +19,8 @@
   .zona.off { cursor: not-allowed; opacity: .55; }
   .zona .titolo { font-weight: 600; }
   .zona .sotto { color: var(--grigio); font-size: 12px; margin-top: 4px; }
+  .zona a { color: var(--viola); }
+  .zona.off a { pointer-events: none; color: var(--grigio); }
   input[type=file] { display: none; }
   ul { list-style: none; margin: 10px 0 0; padding: 0; max-height: 112px; overflow-y: auto; }
   li { display: flex; justify-content: space-between; align-items: center; padding: 4px 8px; border-radius: 6px; }
@@ -43,8 +45,10 @@
   <div class="zona" id="zona">
     <div class="titolo" id="zona-titolo">📂 Trascina qui i documenti o clicca per sceglierli</div>
     <div class="sotto" id="zona-sotto"></div>
+    <div class="sotto"><a href="#" id="link-cartella">oppure scegli una cartella intera</a></div>
   </div>
   <input type="file" id="scegli" multiple>
+  <input type="file" id="scegli-cartella" webkitdirectory multiple>
   <ul id="elenco"></ul>
   <div class="barra-azioni">
     <button class="invia" id="invia" disabled>📤 Processa documenti</button>
@@ -71,6 +75,8 @@ if (CFG.disabilitato) {
 
 const fmt = b => b >= MB ? `${(b / MB).toFixed(1)} MB` : `${Math.max(1, Math.round(b / 1024))} KB`;
 const estensioneOk = f => CFG.estensioni.includes(f.name.slice(f.name.lastIndexOf(".")).toLowerCase());
+// Dentro una cartella il nome inviato al backend comprende il percorso, così file omonimi restano distinti
+const nomeDi = f => f.percorso || f.webkitRelativePath || f.name;
 const messaggio = (testo, tipo = "") => { $("msg").textContent = testo; $("msg").className = "msg " + tipo; };
 
 function aggiungi(lista) {
@@ -78,7 +84,7 @@ function aggiungi(lista) {
   const scartati = [];
   for (const f of lista) {
     if (!estensioneOk(f)) { scartati.push(f.name); continue; }
-    if (!files.some(g => g.name === f.name && g.size === f.size)) files.push(f);
+    if (!files.some(g => nomeDi(g) === nomeDi(f) && g.size === f.size)) files.push(f);
   }
   messaggio(scartati.length ? `Formato non supportato, ignorati: ${scartati.join(", ")}` : "", scartati.length ? "errore" : "");
   disegna();
@@ -90,7 +96,7 @@ function disegna() {
     const li = document.createElement("li");
     if (f.size > CFG.max_mb * MB) li.className = "troppo";
     li.innerHTML = `<span class="nome"></span><span><span class="dim"></span><button class="togli" title="Rimuovi">✕</button></span>`;
-    li.querySelector(".nome").textContent = f.name;
+    li.querySelector(".nome").textContent = nomeDi(f);
     li.querySelector(".dim").textContent = fmt(f.size) + (f.size > CFG.max_mb * MB ? ` (oltre ${CFG.max_mb} MB)` : "");
     li.querySelector(".togli").onclick = () => { if (!inInvio) { files.splice(i, 1); disegna(); } };
     li.querySelector(".togli").disabled = inInvio;
@@ -104,13 +110,40 @@ function disegna() {
 
 $("zona").onclick = () => { if (!CFG.disabilitato && !inInvio) $("scegli").click(); };
 $("scegli").onchange = e => { aggiungi(e.target.files); e.target.value = ""; };
+$("scegli-cartella").onchange = e => { aggiungi(e.target.files); e.target.value = ""; };
+$("link-cartella").onclick = e => {
+  e.preventDefault(); e.stopPropagation();
+  if (!CFG.disabilitato && !inInvio) $("scegli-cartella").click();
+};
 ["dragenter", "dragover"].forEach(ev => $("zona").addEventListener(ev, e => {
   e.preventDefault(); if (!CFG.disabilitato && !inInvio) $("zona").classList.add("sopra");
 }));
 ["dragleave", "drop"].forEach(ev => $("zona").addEventListener(ev, e => {
   e.preventDefault(); $("zona").classList.remove("sopra");
 }));
-$("zona").addEventListener("drop", e => aggiungi(e.dataTransfer.files));
+$("zona").addEventListener("drop", async e => {
+  const voci = [...e.dataTransfer.items].map(i => i.webkitGetAsEntry && i.webkitGetAsEntry()).filter(Boolean);
+  if (!voci.some(v => v.isDirectory)) { aggiungi(e.dataTransfer.files); return; }
+  const trovati = [];
+  for (const v of voci) await leggiVoce(v, "", trovati);
+  aggiungi(trovati);
+});
+
+// Cartelle trascinate: raccoglie i file di tutte le sottocartelle
+async function leggiVoce(voce, prefisso, out) {
+  if (voce.isFile) {
+    const f = await new Promise((ok, ko) => voce.file(ok, ko));
+    f.percorso = prefisso + f.name;
+    out.push(f);
+    return;
+  }
+  const lettore = voce.createReader();
+  let blocco;
+  do {
+    blocco = await new Promise((ok, ko) => lettore.readEntries(ok, ko));  // restituisce al massimo 100 voci per volta
+    for (const v of blocco) await leggiVoce(v, prefisso + voce.name + "/", out);
+  } while (blocco.length);
+}
 
 const avvisoUscita = e => { e.preventDefault(); e.returnValue = ""; };
 
@@ -134,7 +167,7 @@ $("invia").onclick = async () => {
   messaggio("⏳ Invio dei file al server: non chiudere e non cambiare pagina fino al termine.");
 
   const dati = new FormData();
-  files.forEach(f => dati.append("files", f, f.name));
+  files.forEach(f => dati.append("files", f, nomeDi(f)));
   const xhr = new XMLHttpRequest();
   xhr.open("POST", `${CFG.backend}/ingest-jobs?lotto=${encodeURIComponent(CFG.lotto)}`);
   xhr.upload.onprogress = e => {
@@ -155,7 +188,9 @@ $("invia").onclick = async () => {
   xhr.onload = () => {
     if (xhr.status === 202) {
       fine(true, "✅ Invio completato: elaborazione avviata. La pagina si aggiorna da sola.");
-      controllaAvvio(JSON.parse(xhr.responseText).map(j => j.id));
+      const ids = JSON.parse(xhr.responseText).map(j => j.id);
+      if (ids.length) controllaAvvio(ids);
+      else messaggio("Nessun file supportato negli archivi inviati.", "errore");
     } else {
       let dettaglio = xhr.statusText;
       try { dettaglio = JSON.parse(xhr.responseText).detail || dettaglio; } catch (e) {}

@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import shutil
+import zipfile
 from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
@@ -13,7 +14,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).parent.parent))
 load_dotenv()
 
-from agents.extraction_agent import pipeline_ingestion, DocumentoTroppoGrande
+from agents.extraction_agent import pipeline_ingestion, estrai_archivio, SUPPORTED_EXT, DocumentoTroppoGrande
 from agents import jobs
 from agents.orchestrator import Orchestrator
 from agents.scope_guardian import ScopeGuardian, carica_contratto
@@ -69,6 +70,10 @@ async def ingest(file: UploadFile = File(...), project_id: str = Query(None)):
             tmp.write(chunk)
         tmp_path = tmp.name
     try:
+        if suffix.lower() == ".zip":
+            return _ingest_archivio(tmp_path, file.filename, pid)
+        if suffix.lower() not in SUPPORTED_EXT:
+            raise HTTPException(status_code=415, detail=f"Formato non supportato: {suffix}")
         result = pipeline_ingestion(tmp_path, pid, source_name=file.filename)
     except DocumentoTroppoGrande as e:
         raise HTTPException(status_code=413, detail=str(e))
@@ -77,16 +82,43 @@ async def ingest(file: UploadFile = File(...), project_id: str = Query(None)):
     return result
 
 
+def _ingest_archivio(zip_path: str, zip_name: str, pid: str) -> dict:
+    out_dir = tempfile.mkdtemp(prefix="ipmp_zip_")
+    try:
+        try:
+            estratti = estrai_archivio(zip_path, out_dir)
+        except (ValueError, zipfile.BadZipFile) as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        files = []
+        for path, rel in estratti:
+            try:
+                r = pipeline_ingestion(path, pid, source_name=f"{zip_name}/{rel}")
+                r["_ok"] = True
+            except Exception as e:
+                r = {"source": f"{zip_name}/{rel}", "_ok": False, "error": str(e)}
+            files.append(r)
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+    return {
+        "source": zip_name,
+        "archive": True,
+        "files": files,
+        "chunks": sum(f.get("chunks", 0) for f in files),
+    }
+
+
 @app.post("/ingest-job", status_code=202)
 async def ingest_job(file: UploadFile = File(...), project_id: str = Query(None)):
     """Accoda il documento e risponde subito: l'avanzamento si legge con GET /jobs."""
     pid = project_id or PROJECT_ID
     suffix = Path(file.filename).suffix
+    _controlla_formato(file.filename)
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         while chunk := await file.read(8 * 1024 * 1024):
             tmp.write(chunk)
         tmp_path = tmp.name
-    return jobs.avvia(tmp_path, pid, file.filename).to_dict()
+    accodati = _accoda(tmp_path, file.filename, pid)
+    return accodati[0] if len(accodati) == 1 and suffix.lower() != ".zip" else accodati
 
 
 @app.post("/ingest-jobs", status_code=202)
@@ -98,6 +130,8 @@ async def ingest_jobs(files: list[UploadFile] = File(...), project_id: str = Que
     senza interrompere un invio in corso.
     """
     pid = project_id or PROJECT_ID
+    for f in files:
+        _controlla_formato(f.filename)
     salvati = []
     try:
         for f in files:
@@ -110,7 +144,44 @@ async def ingest_jobs(files: list[UploadFile] = File(...), project_id: str = Que
         for path, _ in salvati:
             os.unlink(path)
         raise
-    return [jobs.avvia(path, pid, nome, lotto).to_dict() for path, nome in salvati]
+    accodati = []
+    for i, (path, nome) in enumerate(salvati):
+        try:
+            accodati.extend(_accoda(path, nome, pid, lotto))
+        except Exception:
+            for rimasto, _ in salvati[i + 1:]:   # i file non ancora accodati non verrebbero mai cancellati
+                os.unlink(rimasto)
+            raise
+    return accodati
+
+
+def _controlla_formato(nome: str) -> None:
+    suffix = Path(nome).suffix.lower()
+    if suffix != ".zip" and suffix not in SUPPORTED_EXT:
+        raise HTTPException(status_code=415, detail=f"Formato non supportato: {nome}")
+
+
+def _accoda(tmp_path: str, nome: str, pid: str, lotto: str = None) -> list[dict]:
+    """Accoda il file; un archivio ZIP diventa un'elaborazione per ogni file supportato che contiene."""
+    if Path(nome).suffix.lower() != ".zip":
+        return [jobs.avvia(tmp_path, pid, nome, lotto).to_dict()]
+    out_dir = tempfile.mkdtemp(prefix="ipmp_zip_")
+    try:
+        try:
+            estratti = estrai_archivio(tmp_path, out_dir)
+        except (ValueError, zipfile.BadZipFile) as e:
+            raise HTTPException(status_code=400, detail=f"{nome}: {e}")
+        # Ogni file estratto diventa un file temporaneo a sé: il job lo cancella al termine
+        accodati = []
+        for path, rel in estratti:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(rel).suffix) as tmp:
+                pass
+            shutil.move(path, tmp.name)
+            accodati.append(jobs.avvia(tmp.name, pid, f"{nome}/{rel}", lotto).to_dict())
+        return accodati
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        os.unlink(tmp_path)
 
 
 @app.get("/jobs")

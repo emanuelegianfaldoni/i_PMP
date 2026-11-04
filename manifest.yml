@@ -7,6 +7,7 @@ applications:
     command: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     env:
       PROJECT_ID: demo
+      USE_SQLITE: "false"
       FRONTEND_URL: https://ipmp-app.cfapps.eu10-004.hana.ondemand.com
       AICORE_RESOURCE_GROUP: i-pmp
       AICORE_BASE_URL: https://api.ai.prod.eu-central-1.aws.ml.hana.ondemand.com
