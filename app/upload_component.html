@@ -1,0 +1,192 @@
+<!--
+  Caricamento documenti diretto browser → backend (POST /ingest-jobs).
+  I file non passano dal processo Streamlit, che così non deve tenerli in memoria.
+  Segnaposto sostituiti da app.py: __CONFIG__ (JSON con backend, lotto, disabilitato, motivo, estensioni, max_mb).
+-->
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root { --viola: #7C3AED; --viola-chiaro: #F5F3FF; --testo: #1E1B4B; --grigio: #6B7280; --bordo: #DDD6FE;
+          --errore: #DC2626; --ok: #059669; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: 'Inter', sans-serif; color: var(--testo); font-size: 14px; background: transparent; }
+  .zona { border: 2px dashed var(--bordo); border-radius: 12px; background: var(--viola-chiaro); padding: 18px;
+          text-align: center; cursor: pointer; transition: border-color .15s, background .15s; }
+  .zona:hover, .zona.sopra { border-color: var(--viola); background: #EDE9FE; }
+  .zona.off { cursor: not-allowed; opacity: .55; }
+  .zona .titolo { font-weight: 600; }
+  .zona .sotto { color: var(--grigio); font-size: 12px; margin-top: 4px; }
+  input[type=file] { display: none; }
+  ul { list-style: none; margin: 10px 0 0; padding: 0; max-height: 112px; overflow-y: auto; }
+  li { display: flex; justify-content: space-between; align-items: center; padding: 4px 8px; border-radius: 6px; }
+  li:nth-child(odd) { background: #FAFAFF; }
+  li .nome { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-right: 8px; }
+  li .dim { color: var(--grigio); font-size: 12px; white-space: nowrap; }
+  li .togli { border: none; background: none; color: var(--grigio); cursor: pointer; font-size: 15px; margin-left: 6px; }
+  li.troppo .dim { color: var(--errore); font-weight: 600; }
+  .barra-azioni { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
+  button.invia { background: var(--viola); color: #fff; border: none; border-radius: 8px; padding: 8px 16px;
+                 font: 600 14px 'Inter', sans-serif; cursor: pointer; }
+  button.invia:disabled { opacity: .45; cursor: not-allowed; }
+  .totale { color: var(--grigio); font-size: 12px; }
+  .progresso { height: 8px; background: #EDE9FE; border-radius: 4px; overflow: hidden; margin-top: 10px; display: none; }
+  .progresso div { height: 100%; width: 0; background: var(--viola); transition: width .2s; }
+  .msg { margin-top: 8px; font-size: 13px; min-height: 18px; }
+  .msg.errore { color: var(--errore); }
+  .msg.ok { color: var(--ok); }
+</style>
+</head>
+<body>
+  <div class="zona" id="zona">
+    <div class="titolo" id="zona-titolo">📂 Trascina qui i documenti o clicca per sceglierli</div>
+    <div class="sotto" id="zona-sotto"></div>
+  </div>
+  <input type="file" id="scegli" multiple>
+  <ul id="elenco"></ul>
+  <div class="barra-azioni">
+    <button class="invia" id="invia" disabled>📤 Processa documenti</button>
+    <span class="totale" id="totale"></span>
+  </div>
+  <div class="progresso" id="progresso"><div id="riempimento"></div></div>
+  <div class="msg" id="msg"></div>
+
+<script>
+const CFG = __CONFIG__;
+const MB = 1024 * 1024;
+const $ = id => document.getElementById(id);
+let files = [];
+let inInvio = false;
+
+$("scegli").accept = CFG.estensioni.join(",");
+$("zona-sotto").textContent = CFG.disabilitato
+  ? CFG.motivo
+  : `Supportati: ${CFG.estensioni.map(e => e.slice(1).toUpperCase()).join(", ")} · max ${CFG.max_mb} MB per file`;
+if (CFG.disabilitato) {
+  $("zona").classList.add("off");
+  $("zona-titolo").textContent = "🔒 Caricamento non disponibile";
+}
+
+const fmt = b => b >= MB ? `${(b / MB).toFixed(1)} MB` : `${Math.max(1, Math.round(b / 1024))} KB`;
+const estensioneOk = f => CFG.estensioni.includes(f.name.slice(f.name.lastIndexOf(".")).toLowerCase());
+const messaggio = (testo, tipo = "") => { $("msg").textContent = testo; $("msg").className = "msg " + tipo; };
+
+function aggiungi(lista) {
+  if (CFG.disabilitato || inInvio) return;
+  const scartati = [];
+  for (const f of lista) {
+    if (!estensioneOk(f)) { scartati.push(f.name); continue; }
+    if (!files.some(g => g.name === f.name && g.size === f.size)) files.push(f);
+  }
+  messaggio(scartati.length ? `Formato non supportato, ignorati: ${scartati.join(", ")}` : "", scartati.length ? "errore" : "");
+  disegna();
+}
+
+function disegna() {
+  $("elenco").innerHTML = "";
+  files.forEach((f, i) => {
+    const li = document.createElement("li");
+    if (f.size > CFG.max_mb * MB) li.className = "troppo";
+    li.innerHTML = `<span class="nome"></span><span><span class="dim"></span><button class="togli" title="Rimuovi">✕</button></span>`;
+    li.querySelector(".nome").textContent = f.name;
+    li.querySelector(".dim").textContent = fmt(f.size) + (f.size > CFG.max_mb * MB ? ` (oltre ${CFG.max_mb} MB)` : "");
+    li.querySelector(".togli").onclick = () => { if (!inInvio) { files.splice(i, 1); disegna(); } };
+    li.querySelector(".togli").disabled = inInvio;
+    $("elenco").appendChild(li);
+  });
+  const tot = files.reduce((s, f) => s + f.size, 0);
+  const troppo = files.some(f => f.size > CFG.max_mb * MB);
+  $("totale").textContent = files.length ? `${files.length} file · ${fmt(tot)}` : "";
+  $("invia").disabled = CFG.disabilitato || inInvio || !files.length || troppo;
+}
+
+$("zona").onclick = () => { if (!CFG.disabilitato && !inInvio) $("scegli").click(); };
+$("scegli").onchange = e => { aggiungi(e.target.files); e.target.value = ""; };
+["dragenter", "dragover"].forEach(ev => $("zona").addEventListener(ev, e => {
+  e.preventDefault(); if (!CFG.disabilitato && !inInvio) $("zona").classList.add("sopra");
+}));
+["dragleave", "drop"].forEach(ev => $("zona").addEventListener(ev, e => {
+  e.preventDefault(); $("zona").classList.remove("sopra");
+}));
+$("zona").addEventListener("drop", e => aggiungi(e.dataTransfer.files));
+
+const avvisoUscita = e => { e.preventDefault(); e.returnValue = ""; };
+
+$("invia").onclick = async () => {
+  const tot = files.reduce((s, f) => s + f.size, 0);
+  try {
+    const h = await (await fetch(CFG.backend + "/health")).json();
+    if (tot / MB > h.disk_free_mb - 100) {
+      messaggio(`Spazio insufficiente sul server: servono ${fmt(tot)}, liberi ${h.disk_free_mb} MB. Invia meno file per volta.`, "errore");
+      return;
+    }
+  } catch (e) {
+    messaggio("Backend non raggiungibile. Riprova tra poco.", "errore");
+    return;
+  }
+
+  inInvio = true; disegna();
+  $("zona").classList.add("off");
+  $("progresso").style.display = "block";
+  window.addEventListener("beforeunload", avvisoUscita);
+  messaggio("⏳ Invio dei file al server: non chiudere e non cambiare pagina fino al termine.");
+
+  const dati = new FormData();
+  files.forEach(f => dati.append("files", f, f.name));
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", `${CFG.backend}/ingest-jobs?lotto=${encodeURIComponent(CFG.lotto)}`);
+  xhr.upload.onprogress = e => {
+    if (!e.lengthComputable) return;
+    const p = e.loaded / e.total;
+    $("riempimento").style.width = (p * 100).toFixed(1) + "%";
+    messaggio(p < 1
+      ? `⏳ Invio ${fmt(e.loaded)} di ${fmt(e.total)} (${Math.round(p * 100)}%): non chiudere e non cambiare pagina.`
+      : "⏳ Salvataggio sul server...");
+  };
+  const fine = (ok, testo) => {
+    window.removeEventListener("beforeunload", avvisoUscita);
+    inInvio = false;
+    if (ok) { files = []; } else { $("zona").classList.remove("off"); $("progresso").style.display = "none"; }
+    disegna();
+    messaggio(testo, ok ? "ok" : "errore");
+  };
+  xhr.onload = () => {
+    if (xhr.status === 202) {
+      fine(true, "✅ Invio completato: elaborazione avviata. La pagina si aggiorna da sola.");
+      controllaAvvio(JSON.parse(xhr.responseText).map(j => j.id));
+    } else {
+      let dettaglio = xhr.statusText;
+      try { dettaglio = JSON.parse(xhr.responseText).detail || dettaglio; } catch (e) {}
+      fine(false, `Invio non riuscito (${xhr.status}): ${dettaglio}`);
+    }
+  };
+  xhr.onerror = () => fine(false, "Invio interrotto: connessione con il server persa. Riprova.");
+  xhr.send(dati);
+};
+
+// Di norma la pagina si aggiorna entro pochi secondi e questo componente viene ricaricato.
+// Se invece le elaborazioni spariscono (riavvio del server) lo segnala invece di restare in attesa.
+function controllaAvvio(ids) {
+  let tentativi = 0;
+  const timer = setInterval(async () => {
+    tentativi++;
+    try {
+      const r = await fetch(`${CFG.backend}/jobs/${ids[0]}`);
+      if (r.status === 404) {
+        clearInterval(timer);
+        $("zona").classList.remove("off");
+        $("progresso").style.display = "none";
+        messaggio("⚠️ Il server si è riavviato e l'elaborazione non è partita. Ricarica la pagina e invia di nuovo i file " +
+                  "(quelli già elaborati verranno saltati).", "errore");
+      }
+    } catch (e) { /* server momentaneamente irraggiungibile: riprova al giro successivo */ }
+    if (tentativi >= 40) clearInterval(timer);
+  }, 5000);
+}
+
+disegna();
+</script>
+</body>
+</html>

@@ -2,7 +2,7 @@
 enableCORS = false
 enableXsrfProtection = false
 headless = true
-maxUploadSize = 3072
+maxUploadSize = 500
 
 [theme]
 primaryColor = "#7C3AED"

@@ -1,9 +1,15 @@
 import os
 import sys
+import json
+import shutil
+import tempfile
+import uuid
 from pathlib import Path
 
+import httpx
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -315,6 +321,70 @@ def hero(tag: str, title: str, subtitle: str = ""):
     </div>""", unsafe_allow_html=True)
 
 
+def invia_file(path: str, f):
+    """Invia un file caricato al backend leggendolo a blocchi, senza copiarlo in memoria."""
+    url = BACKEND.rstrip("/") + path
+    f.seek(0)
+    try:
+        r = httpx.post(url, files={"file": (f.name, f, f.type)}, timeout=600)
+        r.raise_for_status()
+        return r
+    except httpx.ConnectError:
+        st.error("Backend non raggiungibile. Avvia il backend prima.")
+    except httpx.HTTPStatusError as e:
+        st.error(f"Errore API: {e.response.text}")
+    except httpx.HTTPError as e:
+        st.error(f"Errore di comunicazione con il backend: {e}")
+    return None
+
+
+JOB_ATTIVI = ("in_coda", "in_corso")
+ESTENSIONI_DOCUMENTI = [".pdf", ".docx", ".msg", ".pst", ".pptx", ".xlsx", ".xls", ".csv", ".txt"]
+_HTML_CARICAMENTO = (Path(__file__).parent / "upload_component.html").read_text(encoding="utf-8")
+
+
+def componente_caricamento(lotto: str, disabilitato: bool, motivo: str):
+    """Caricamento documenti dal browser direttamente al backend: i file non passano dalla memoria di Streamlit."""
+    config = {"backend": BACKEND.rstrip("/"), "lotto": lotto, "disabilitato": disabilitato, "motivo": motivo,
+              "estensioni": ESTENSIONI_DOCUMENTI, "max_mb": 500}
+    components.html(_HTML_CARICAMENTO.replace("__CONFIG__", json.dumps(config)), height=290)
+
+
+def leggi_jobs() -> list[dict]:
+    """Elaborazioni documenti del progetto (in corso e recenti); lista vuota se il backend non risponde."""
+    try:
+        r = requests.get(BACKEND.rstrip("/") + "/jobs", timeout=10)
+        return r.json() if r.ok else []
+    except requests.exceptions.RequestException:
+        return []
+
+
+MIN_SPAZIO_MB = 300  # sotto questa soglia il caricamento file viene disattivato
+
+
+def spazio_libero_mb() -> int:
+    """Spazio libero minimo tra frontend (upload Streamlit) e backend (file temporanei)."""
+    liberi = [shutil.disk_usage(tempfile.gettempdir()).free // (1024 * 1024)]
+    try:
+        r = requests.get(BACKEND.rstrip("/") + "/health", timeout=5)
+        if r.ok and "disk_free_mb" in r.json():
+            liberi.append(r.json()["disk_free_mb"])
+    except requests.exceptions.RequestException:
+        pass
+    return min(liberi)
+
+
+def upload_bloccato() -> bool:
+    """Mostra un avviso e restituisce True se lo spazio non basta per nuovi caricamenti."""
+    libero = spazio_libero_mb()
+    if libero < MIN_SPAZIO_MB:
+        st.warning(f"⚠️ Spazio di archiviazione quasi esaurito ({libero} MB liberi). "
+                   "Caricamento disattivato: riprova più tardi o contatta l'amministratore.")
+        return True
+    st.caption(f"Spazio disponibile per i caricamenti: {libero} MB")
+    return False
+
+
 def section(label: str):
     st.markdown(f'<div class="section-label">{label}</div>', unsafe_allow_html=True)
 
@@ -440,50 +510,144 @@ elif page == "chat":
 # ── DOCUMENTI ─────────────────────────────────────────────────────────────────
 elif page == "docs":
     hero("📄 Knowledge", "Gestione Documenti", "Carica, indicizza e gestisci la knowledge base del progetto")
+    ss = st.session_state
+    ss.setdefault("lotto", uuid.uuid4().hex)   # identifica il prossimo invio di file
+    ss.setdefault("lotto_riepilogo", None)    # invio di cui mostrare il riepilogo
+    jobs_progetto = leggi_jobs()
+    jobs_attivi = [j for j in jobs_progetto if j["stato"] in JOB_ATTIVI]
+    ss.ci_sono_attivi = bool(jobs_attivi)
+    if any(j["lotto"] == ss.lotto for j in jobs_progetto):
+        # Il backend ha ricevuto l'invio: il riepilogo segue questo lotto, il prossimo invio ne usa uno nuovo
+        ss.lotto_riepilogo = ss.lotto
+        ss.lotto = uuid.uuid4().hex
+    # Bloccato anche se l'elaborazione l'ha avviata un'altra sessione: un caricamento alla volta
+    in_elaborazione = bool(jobs_attivi)
+    spazio_esaurito = upload_bloccato()
+    bloccato = spazio_esaurito or in_elaborazione
 
     tab1, tab2, tab3 = st.tabs(["  📁  Documenti  ", "  📜  Contratto & CR  ", "  🗑  Reset Memoria  "])
 
     with tab1:
         section("Carica documenti")
-        st.caption("Supportati: PDF, DOCX, MSG, PST, PPTX, XLSX, XLS, TXT")
-        uploaded_files = st.file_uploader("", type=["pdf","docx","msg","pst","pptx","xlsx","xls","txt"],
-                                          key="doc_upload", accept_multiple_files=True, label_visibility="collapsed")
-        if uploaded_files and st.button("📤  Processa documenti", type="primary"):
-            totale = len(uploaded_files)
-            bar = st.progress(0, text=f"Elaborazione 0/{totale}...")
-            risultati = []
-            for idx, f in enumerate(uploaded_files):
-                with st.spinner(f"[{idx+1}/{totale}] {f.name}"):
-                    r = api("post", "/ingest", files={"file": (f.name, f.getvalue(), f.type)})
-                res = r.json() if r else {}
-                res["_nome"] = f.name
-                res["_ok"] = bool(r)
-                risultati.append(res)
-                bar.progress((idx+1)/totale, text=f"Elaborazione {idx+1}/{totale}...")
-            bar.empty()
+        motivo = ("Elaborazione in corso: potrai aggiungere altri documenti al termine." if in_elaborazione
+                  else "Spazio di archiviazione quasi esaurito." if spazio_esaurito else "")
+        componente_caricamento(ss.lotto, bloccato, motivo)
 
-            ok = sum(1 for x in risultati if x["_ok"])
+        @st.fragment(run_every=3)
+        def pannello_elaborazioni():
+            jobs_ora = leggi_jobs()
+            attivi = [j for j in jobs_ora if j["stato"] in JOB_ATTIVI]
+            # Inizio o fine elaborazione, oppure invio appena arrivato: aggiorna tutta la pagina
+            if bool(attivi) != ss.get("ci_sono_attivi", False) or any(j["lotto"] == ss.lotto for j in jobs_ora):
+                st.rerun()
+            if not attivi:
+                return
+            st.info("⏳ Elaborazione in corso: non è possibile aggiungere altri documenti fino al termine. "
+                    "Puoi anche chiudere la pagina: l'elaborazione continua sul server.")
+            for j in attivi:
+                if j["stato"] == "in_coda":
+                    testo = f"**{j['source']}** · in coda"
+                else:
+                    dettaglio = f" · {j['chunks_totali']} chunk" if j["chunks_totali"] else ""
+                    testo = f"**{j['source']}** · {j['fase']}{dettaglio} · {j['percentuale']:.0%}"
+                c1, c2 = st.columns([6, 1], vertical_alignment="bottom")
+                c1.progress(j["percentuale"], text=testo)
+                annullando = j["fase"].startswith("Annull")
+                if c2.button("Annullamento..." if annullando else "⏹ Annulla", key=f"annulla_{j['id']}",
+                             disabled=annullando):
+                    api("post", f"/jobs/{j['id']}/cancel")
+                    st.rerun(scope="fragment")
+
+        pannello_elaborazioni()
+
+        miei = [j for j in jobs_progetto if ss.lotto_riepilogo and j["lotto"] == ss.lotto_riepilogo]
+        if ss.lotto_riepilogo and not miei:
+            st.warning("⚠️ Riepilogo dell'ultimo invio non disponibile: il server è stato riavviato. "
+                       "Controlla l'elenco qui sotto e ricarica i file mancanti.")
+            if st.button("✕ Chiudi", key="chiudi_riepilogo_perso"):
+                ss.lotto_riepilogo = None
+                st.rerun()
+        if miei and not any(j["stato"] in JOB_ATTIVI for j in miei):
+            totale = len(miei)
+            ok = sum(1 for j in miei if j["stato"] == "completato")
             st.success(f"✅ {ok}/{totale} file processati") if ok == totale else st.warning(f"⚠️ {ok}/{totale} file processati")
+            doppi = sum(1 for j in miei if (j["risultato"] or {}).get("duplicate_of"))
+            if doppi:
+                st.info(f"ℹ️ {doppi} file già presenti in memoria: non sono stati rielaborati")
 
-            for res in risultati:
-                icon = "✅" if res["_ok"] else "❌"
-                with st.expander(f"{icon} {res['_nome']}", expanded=False):
-                    if res["_ok"]:
+            for j in miei:
+                res = j["risultato"] or {}
+                icon = {"completato": "♻️" if res.get("duplicate_of") else "✅", "annullato": "⏹"}.get(j["stato"], "❌")
+                with st.expander(f"{icon} {j['source']}", expanded=j["stato"] == "errore"):
+                    if j["stato"] == "annullato":
+                        st.write("Elaborazione annullata: nessun dato di questo file è rimasto in memoria.")
+                    elif j["stato"] == "errore":
+                        st.error(j["errore"])
+                    elif res.get("duplicate_of"):
+                        st.write(f"Contenuto identico a **{res['duplicate_of']}**, già caricato. Nessuna modifica.")
+                    else:
+                        if res.get("replaced"):
+                            st.caption("🔄 Nuova versione: ha sostituito il documento caricato in precedenza con lo stesso nome")
                         c1,c2,c3,c4 = st.columns(4)
                         c1.metric("Chunk", res.get("chunks",0))
                         ix = res.get("indexing",{})
                         c2.metric("Indicizzati", ix.get("chunks_indexed","?"))
                         dec = res.get("decisions",{})
-                        c3.metric("Decisioni", dec.get("found",0))
+                        c3.metric("Decisioni", "—" if dec.get("skipped") else dec.get("found",0),
+                                  help="Non cercate: file di dati tabellari" if dec.get("skipped") else None)
                         sc = res.get("scope",{})
                         c4.metric("Scope", "⚠️ Out" if sc.get("fuori_scope") else "✅ OK")
+            if st.button("✕ Chiudi riepilogo", key="chiudi_riepilogo"):
+                ss.lotto_riepilogo = None
+                st.rerun()
+
+        section("📚 Documenti in memoria")
+        r = api("get", "/documents")
+        documenti = r.json() if r else []
+        filtro = st.text_input("Cerca per nome", key="doc_filtro", placeholder="🔍 Cerca per nome file...",
+                               label_visibility="collapsed")
+        if filtro:
+            documenti = [d for d in documenti if filtro.lower() in d["source"].lower()]
+
+        da_eliminare = st.session_state.get("doc_da_eliminare")
+        if da_eliminare:
+            st.warning(f"Eliminare **{da_eliminare}** dalla memoria? Verranno rimossi chunk, riassunto, "
+                       "decisioni estratte e alert non gestiti. L'operazione non è reversibile.")
+            cc1, cc2, _ = st.columns([1, 1, 4])
+            if cc1.button("🗑 Elimina", type="primary", key="doc_conferma"):
+                if api("delete", "/documents", params={"source": da_eliminare}):
+                    st.toast(f"Eliminato: {da_eliminare}")
+                st.session_state.doc_da_eliminare = None
+                st.rerun()
+            if cc2.button("Annulla", key="doc_annulla"):
+                st.session_state.doc_da_eliminare = None
+                st.rerun()
+
+        gruppi = [("Documenti di progetto", [d for d in documenti if not d["contratto"]]),
+                  ("Contratto e Change Request", [d for d in documenti if d["contratto"]])]
+        if not documenti:
+            st.caption("Nessun documento trovato.")
+        for titolo, elenco in gruppi:
+            if not elenco:
+                continue
+            st.caption(f"{titolo} · {len(elenco)}")
+            for d in elenco:
+                nome = d["source"].removeprefix("CONTRATTO::")
+                c1, c2, c3, c4, c5 = st.columns([5, 2, 1, 1, 1], vertical_alignment="center")
+                c1.markdown(f"**{nome}**")
+                c2.caption(f"🕒 {d['caricato_il']}")
+                c3.caption(f"{d['chunks']} chunk")
+                c4.caption(f"📌 {d['decisioni']}" + (f" · ⚠️ {d['alert_aperti']}" if d["alert_aperti"] else ""))
+                if c5.button("🗑", key=f"del_{d['source']}", help="Elimina questo documento", disabled=in_elaborazione):
+                    st.session_state.doc_da_eliminare = d["source"]
+                    st.rerun()
 
     with tab2:
         col_c, col_cr = st.columns(2, gap="large")
         with col_c:
             section("📜 Contratto baseline")
             st.caption("Necessario per lo Scope Guardian. Puoi caricare SOW + allegati.")
-            contracts = st.file_uploader("", type=["pdf","docx","txt"], key="contract_upload",
+            contracts = st.file_uploader("", type=["pdf","docx","txt"], key="contract_upload", disabled=bloccato,
                                          accept_multiple_files=True, label_visibility="collapsed")
             if contracts and st.button("📜 Carica contratto", type="primary"):
                 total = len(contracts)
@@ -491,7 +655,7 @@ elif page == "docs":
                 tot_chunks = 0
                 for idx, c in enumerate(contracts):
                     with st.spinner(f"{c.name}..."):
-                        r = api("post", "/load-contract", files={"file": (c.name, c.getvalue(), c.type)})
+                        r = invia_file("/load-contract", c)
                     if r:
                         n = r.json().get("chunks_loaded", 0)
                         tot_chunks += n
@@ -505,12 +669,12 @@ elif page == "docs":
         with col_cr:
             section("📋 Change Request approvate")
             st.caption("Aggiunge la CR al baseline contrattuale per l'analisi di scope futura.")
-            cr_files = st.file_uploader("", type=["pdf","docx","txt"], key="cr_upload",
+            cr_files = st.file_uploader("", type=["pdf","docx","txt"], key="cr_upload", disabled=bloccato,
                                         accept_multiple_files=True, label_visibility="collapsed")
             if cr_files and st.button("📋 Carica CR", type="primary"):
                 for cr in cr_files:
                     with st.spinner(f"{cr.name}..."):
-                        r = api("post", "/change-request", files={"file": (cr.name, cr.getvalue(), cr.type)})
+                        r = invia_file("/change-request", cr)
                     if r: st.success(r.json().get("message","CR caricata."))
 
     with tab3:

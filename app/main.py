@@ -5,6 +5,7 @@ import shutil
 from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -12,12 +13,21 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).parent.parent))
 load_dotenv()
 
-from agents.extraction_agent import pipeline_ingestion
+from agents.extraction_agent import pipeline_ingestion, DocumentoTroppoGrande
+from agents import jobs
 from agents.orchestrator import Orchestrator
 from agents.scope_guardian import ScopeGuardian, carica_contratto
 from agents.playbook import PlaybookAgent
 
 app = FastAPI(title="i-PMP API", version="1.0")
+
+# Il frontend invia i documenti direttamente dal browser (POST /ingest-jobs): serve il CORS per il suo dominio
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in os.getenv("FRONTEND_URL", "http://localhost:8501").split(",")],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 PROJECT_ID = os.getenv("PROJECT_ID", "demo")
 _orchestrator = Orchestrator()
@@ -26,11 +36,10 @@ _scope = ScopeGuardian()
 
 @app.on_event("startup")
 def startup():
-    from services.hana import get_connection, migrate, is_sqlite
-    if is_sqlite():
-        conn = get_connection()
-        migrate(conn)
-        conn.close()
+    from services.hana import get_connection, migrate
+    conn = get_connection()
+    migrate(conn)
+    conn.close()
 
 
 class QueryRequest(BaseModel):
@@ -46,7 +55,8 @@ class ScopeRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "project_id": PROJECT_ID}
+    disk_free_mb = shutil.disk_usage(tempfile.gettempdir()).free // (1024 * 1024)
+    return {"status": "ok", "project_id": PROJECT_ID, "disk_free_mb": disk_free_mb}
 
 
 @app.post("/ingest")
@@ -60,9 +70,68 @@ async def ingest(file: UploadFile = File(...), project_id: str = Query(None)):
         tmp_path = tmp.name
     try:
         result = pipeline_ingestion(tmp_path, pid, source_name=file.filename)
+    except DocumentoTroppoGrande as e:
+        raise HTTPException(status_code=413, detail=str(e))
     finally:
         os.unlink(tmp_path)
     return result
+
+
+@app.post("/ingest-job", status_code=202)
+async def ingest_job(file: UploadFile = File(...), project_id: str = Query(None)):
+    """Accoda il documento e risponde subito: l'avanzamento si legge con GET /jobs."""
+    pid = project_id or PROJECT_ID
+    suffix = Path(file.filename).suffix
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        while chunk := await file.read(8 * 1024 * 1024):
+            tmp.write(chunk)
+        tmp_path = tmp.name
+    return jobs.avvia(tmp_path, pid, file.filename).to_dict()
+
+
+@app.post("/ingest-jobs", status_code=202)
+async def ingest_jobs(files: list[UploadFile] = File(...), project_id: str = Query(None),
+                      lotto: str = Query(None)):
+    """Riceve più documenti in una richiesta (invio diretto dal browser) e li accoda tutti insieme.
+
+    Le elaborazioni partono solo quando l'invio è completo: il frontend si aggiorna a quel punto,
+    senza interrompere un invio in corso.
+    """
+    pid = project_id or PROJECT_ID
+    salvati = []
+    try:
+        for f in files:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(f.filename).suffix) as tmp:
+                while chunk := await f.read(8 * 1024 * 1024):
+                    tmp.write(chunk)
+            await f.close()   # libera subito la copia temporanea del multipart
+            salvati.append((tmp.name, f.filename))
+    except Exception:
+        for path, _ in salvati:
+            os.unlink(path)
+        raise
+    return [jobs.avvia(path, pid, nome, lotto).to_dict() for path, nome in salvati]
+
+
+@app.get("/jobs")
+def get_jobs(project_id: str = Query(None)):
+    return jobs.elenco(project_id or PROJECT_ID)
+
+
+@app.get("/jobs/{job_id}")
+def get_job(job_id: str):
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Elaborazione non trovata (il server potrebbe essere stato riavviato)")
+    return job.to_dict()
+
+
+@app.post("/jobs/{job_id}/cancel")
+def cancel_job(job_id: str):
+    job = jobs.annulla(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Elaborazione non trovata")
+    return job.to_dict()
 
 
 @app.post("/load-contract")
@@ -139,6 +208,56 @@ def get_decisions(project_id: str = Query(None)):
         }
         for r in rows
     ]
+
+
+@app.get("/documents")
+def get_documents(project_id: str = Query(None)):
+    """Elenco dei documenti in memoria con chunk, decisioni estratte e alert aperti."""
+    from services.hana import get_connection
+    pid = project_id or PROJECT_ID
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT SOURCE_NAME, COUNT(*), MAX(CREATED_AT) FROM IPMP_DOCS "
+            "WHERE PROJECT_ID=? GROUP BY SOURCE_NAME", [pid])
+        docs = cursor.fetchall()
+        cursor.execute(
+            "SELECT SOURCE_NAME, COUNT(*) FROM IPMP_DECISIONS WHERE PROJECT_ID=? GROUP BY SOURCE_NAME", [pid])
+        decisioni = dict(cursor.fetchall())
+        cursor.execute(
+            "SELECT SOURCE_NAME, COUNT(*) FROM IPMP_ALERTS WHERE PROJECT_ID=? AND IS_HANDLED=0 "
+            "GROUP BY SOURCE_NAME", [pid])
+        alert = dict(cursor.fetchall())
+    finally:
+        cursor.close()
+        conn.close()
+    return sorted(
+        [
+            {
+                "source": r[0],
+                "chunks": r[1],
+                "caricato_il": str(r[2])[:16],
+                "decisioni": decisioni.get(r[0], 0),
+                "alert_aperti": alert.get(r[0], 0),
+                "contratto": (r[0] or "").startswith("CONTRATTO::"),
+            }
+            for r in docs
+        ],
+        key=lambda d: d["caricato_il"],
+        reverse=True,
+    )
+
+
+@app.delete("/documents")
+def delete_document(source: str = Query(...), project_id: str = Query(None)):
+    """Elimina un singolo documento: chunk, riassunto, decisioni e alert non gestiti."""
+    from agents.extraction_agent import rimuovi_documento
+    pid = project_id or PROJECT_ID
+    deleted = rimuovi_documento(pid, source)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Documento non trovato: {source}")
+    return {"project_id": pid, "source": source, "deleted": deleted}
 
 
 @app.post("/change-request")

@@ -12,6 +12,22 @@ def migrate(conn) -> None:
             conn.commit()
         except Exception:
             pass  # colonna già presente
+        # IPMP_DOCS: impronta del contenuto per riconoscere i documenti duplicati
+        try:
+            if is_sqlite():
+                cursor.execute("ALTER TABLE IPMP_DOCS ADD COLUMN CONTENT_HASH TEXT")
+            else:
+                cursor.execute("ALTER TABLE IPMP_DOCS ADD (CONTENT_HASH NVARCHAR(64))")
+            conn.commit()
+        except Exception:
+            pass  # colonna già presente
+        # IPMP_DOCS: SOURCE_NAME era NVARCHAR(255), allineato a 500 come nelle altre tabelle
+        if not is_sqlite():
+            try:
+                cursor.execute("ALTER TABLE IPMP_DOCS ALTER (SOURCE_NAME NVARCHAR(500))")
+                conn.commit()
+            except Exception:
+                pass
     finally:
         cursor.close()
 
@@ -36,7 +52,7 @@ def get_connection():
         user=os.getenv("HANA_USER"),
         password=os.getenv("HANA_PASSWORD"),
         encrypt=True,
-        sslValidateCertificate=False,
+        sslValidateCertificate=True,
     )
 
 
